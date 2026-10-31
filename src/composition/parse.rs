@@ -351,23 +351,37 @@ fn parse_path_object(c: &mut Cursor<'_>, limits: &Limits) -> Result<PathData> {
 
 /// Parses a property object `{a, k, ...}`. Whether `k` is static or animated
 /// is decided by its own shape (array of objects = keyframes), not by `a`.
+/// Bound of `y` of easing handles of properties that size geometry, e.g. paths, widths and dashes,
+/// against absurd values. Transforms, opacity and colors take it as it is, like rlottie and Skottie:
+/// AE exports speed over a tiny change of a value as handles far outside, e.g. -286.
+const EASING_Y_BOUND: f32 = 100.0;
+
 fn parse_property<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, limits: &Limits, parse_val: F) -> Result<Property<T>> {
+  parse_property_bounded(c, limits, parse_val, EASING_Y_BOUND)
+}
+
+/// A property of a transform, an opacity or a color, whose easing handles keep their `y`.
+fn parse_property_free<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, limits: &Limits, parse_val: F) -> Result<Property<T>> {
+  parse_property_bounded(c, limits, parse_val, f32::INFINITY)
+}
+
+fn parse_property_bounded<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, limits: &Limits, parse_val: F, easing_y: f32) -> Result<Property<T>> {
   let mut property: Option<Property<T>> = None;
   parse_object_once!(c, |c, key| {
-    b"k" => { property = Some(parse_property_k(c, limits, parse_val)?); },
+    b"k" => { property = Some(parse_property_k(c, limits, parse_val, easing_y)?); },
     _ => { c.skip_value()?; },
   })?;
   property.ok_or_else(|| invalid(c, "property missing k"))
 }
 
-fn parse_property_k<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(kc: &mut Cursor<'_>, limits: &Limits, parse_val: F) -> Result<Property<T>> {
+fn parse_property_k<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(kc: &mut Cursor<'_>, limits: &Limits, parse_val: F, easing_y: f32) -> Result<Property<T>> {
   kc.skip_ws();
   if kc.peek() == Some(b'[') {
     // Peek inside: array of objects → keyframes; anything else → static.
     let mut probe = kc.fork_at(kc.pos() + 1);
     probe.skip_ws();
     if probe.peek() == Some(b'{') {
-      let property = parse_keyframes(kc, limits, parse_val)?;
+      let property = parse_keyframes_bounded(kc, limits, parse_val, easing_y)?;
       if matches!(property, Property::Animated(_)) {
         kc.mark_animated_property();
       }
@@ -385,14 +399,19 @@ struct RawKeyframe<T> {
   spatial: Option<[f32; 4]>,
 }
 
-/// Parses `[{t, s, e?, i, o, h?}, ...]` into a non-empty Timeline.
+#[cfg(test)]
 fn parse_keyframes<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, limits: &Limits, parse_val: F) -> Result<Property<T>> {
+  parse_keyframes_bounded(c, limits, parse_val, EASING_Y_BOUND)
+}
+
+/// Parses `[{t, s, e?, i, o, h?}, ...]` into a non-empty Timeline.
+fn parse_keyframes_bounded<T: Lerp + PartialEq, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, limits: &Limits, parse_val: F, easing_y: f32) -> Result<Property<T>> {
   let mut raw: Vec<RawKeyframe<T>> = Vec::new();
   for_each_element(c, |c| {
     if limits_check() && raw.len() >= limits.max_keyframes {
       return Err(Error::LimitExceeded(Limit::Keyframes));
     }
-    let keyframe = parse_one_keyframe(c, parse_val)?;
+    let keyframe = parse_one_keyframe(c, parse_val, easing_y)?;
 
     c.reserve(&mut raw, 1)?;
     raw.push(keyframe);
@@ -457,7 +476,7 @@ fn timeline_is_constant<T: PartialEq>(first: &Keyframe<T>, rest: &[Keyframe<T>])
     .all(|keyframe| keyframe.spatial.is_none() && &keyframe.value == value && keyframe.end.as_ref().is_none_or(|end| end == value))
 }
 
-fn parse_one_keyframe<T: Lerp, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, parse_val: F) -> Result<RawKeyframe<T>> {
+fn parse_one_keyframe<T: Lerp, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &mut Cursor<'_>, parse_val: F, easing_y: f32) -> Result<RawKeyframe<T>> {
   let mut t = 0.0f32;
   let mut value: Option<T> = None;
   let mut end: Option<T> = None;
@@ -471,8 +490,8 @@ fn parse_one_keyframe<T: Lerp, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &m
     b"s" => { value = Some(parse_val(c)?); },
     b"e" => { end = Some(parse_val(c)?); },
     b"h" => { hold = parse_bool(c)?; },
-    b"o" => { o = parse_easing_handle(c)?; },
-    b"i" => { i = parse_easing_handle(c)?; },
+    b"o" => { o = parse_easing_handle(c, easing_y)?; },
+    b"i" => { i = parse_easing_handle(c, easing_y)?; },
     b"to" => { to = parse_vec2(c).ok(); },
     b"ti" => { ti = parse_vec2(c).ok(); },
     _ => { c.skip_value()?; },
@@ -492,8 +511,8 @@ fn parse_one_keyframe<T: Lerp, F: Fn(&mut Cursor<'_>) -> Result<T> + Copy>(c: &m
   Ok(RawKeyframe { t, value, end, easing, spatial })
 }
 
-/// `{x: n|[n], y: n|[n]}` easing handle.
-fn parse_easing_handle(c: &mut Cursor<'_>) -> Result<(f32, f32)> {
+/// `{x: n|[n], y: n|[n]}` easing handle, its `y` within `easing_y`, see `EASING_Y_BOUND`.
+fn parse_easing_handle(c: &mut Cursor<'_>, easing_y: f32) -> Result<(f32, f32)> {
   let mut x = 0.0f32;
   let mut y = 0.0f32;
   parse_object_once!(c, |c, key| {
@@ -504,8 +523,8 @@ fn parse_easing_handle(c: &mut Cursor<'_>) -> Result<(f32, f32)> {
   // X (time axis) is NOT clamped: AE exports overshoot/anticipation
   // handles with x outside [0,1] and rlottie's VInterpolator uses them
   // verbatim; clamping shifted eased progress on fast segments (TONEmoji
-  // coin 12% oversize). Y stays bounded only against absurd values.
-  Ok((x.clamp(-100.0, 100.0), y.clamp(-100.0, 100.0)))
+  // coin 12% oversize). Y is bounded by the kind of the property.
+  Ok((x.clamp(-100.0, 100.0), y.clamp(-easing_y, easing_y)))
 }
 
 // ---------------------------------------------------------------------------
@@ -515,18 +534,18 @@ fn parse_easing_handle(c: &mut Cursor<'_>) -> Result<(f32, f32)> {
 fn parse_transform(c: &mut Cursor<'_>, limits: &Limits) -> Result<Transform> {
   let mut tf = Transform::identity();
   parse_object_once!(c, |c, key| {
-    b"a" => { tf.anchor = parse_property(c, limits, parse_vec2)?; },
+    b"a" => { tf.anchor = parse_property_free(c, limits, parse_vec2)?; },
     b"p" => { tf.position = parse_position(c, limits)?; },
-    b"s" => { tf.scale = parse_property(c, limits, parse_vec2)?; },
-    b"r" => { tf.rotation = parse_property(c, limits, parse_scalar)?; },
+    b"s" => { tf.scale = parse_property_free(c, limits, parse_vec2)?; },
+    b"r" => { tf.rotation = parse_property_free(c, limits, parse_scalar)?; },
     // A 3D layer (`ddd`) has `rx`, `ry`, `rz` and `or` instead of `r`.
     // Like rlottie, `rz` is its Z rotation and `or` is not applied.
-    b"rx" => { tf.rotation_3d_mut().x = parse_property(c, limits, parse_scalar)?; },
-    b"ry" => { tf.rotation_3d_mut().y = parse_property(c, limits, parse_scalar)?; },
-    b"rz" => { tf.rotation = parse_property(c, limits, parse_scalar)?; },
-    b"o" => { tf.opacity = parse_property(c, limits, parse_scalar)?; },
-    b"sk" => { tf.skew = parse_property(c, limits, parse_scalar)?; },
-    b"sa" => { tf.skew_axis = parse_property(c, limits, parse_scalar)?; },
+    b"rx" => { tf.rotation_3d_mut().x = parse_property_free(c, limits, parse_scalar)?; },
+    b"ry" => { tf.rotation_3d_mut().y = parse_property_free(c, limits, parse_scalar)?; },
+    b"rz" => { tf.rotation = parse_property_free(c, limits, parse_scalar)?; },
+    b"o" => { tf.opacity = parse_property_free(c, limits, parse_scalar)?; },
+    b"sk" => { tf.skew = parse_property_free(c, limits, parse_scalar)?; },
+    b"sa" => { tf.skew_axis = parse_property_free(c, limits, parse_scalar)?; },
     _ => { c.skip_value()?; },
   })?;
   Ok(tf)
@@ -543,10 +562,10 @@ fn parse_position(c: &mut Cursor<'_>, limits: &Limits) -> Result<Position> {
   let mut y_pos: Option<usize> = None;
   parse_object_once!(c, |c, key| {
     b"s" => { split = parse_bool(c)?; },
-    b"k" => { k = Some(parse_property_k(c, limits, parse_vec2)?); },
+    b"k" => { k = Some(parse_property_k(c, limits, parse_vec2, f32::INFINITY)?); },
     b"x" => {
       if split {
-        x = Some(parse_property(c, limits, parse_scalar)?);
+        x = Some(parse_property_free(c, limits, parse_scalar)?);
       } else {
         x_pos = Some(c.pos());
         c.skip_value()?;
@@ -554,7 +573,7 @@ fn parse_position(c: &mut Cursor<'_>, limits: &Limits) -> Result<Position> {
     },
     b"y" => {
       if split {
-        y = Some(parse_property(c, limits, parse_scalar)?);
+        y = Some(parse_property_free(c, limits, parse_scalar)?);
       } else {
         y_pos = Some(c.pos());
         c.skip_value()?;
@@ -565,12 +584,12 @@ fn parse_position(c: &mut Cursor<'_>, limits: &Limits) -> Result<Position> {
   if split {
     let x = match (x, x_pos) {
       (Some(x), _) => x,
-      (None, Some(pos)) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
+      (None, Some(pos)) => parse_property_free(&mut c.fork_at(pos), limits, parse_scalar)?,
       (None, None) => return Err(invalid(c, "split position missing x")),
     };
     let y = match (y, y_pos) {
       (Some(y), _) => y,
-      (None, Some(pos)) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
+      (None, Some(pos)) => parse_property_free(&mut c.fork_at(pos), limits, parse_scalar)?,
       (None, None) => return Err(invalid(c, "split position missing y")),
     };
     Ok(Position::Split { x, y })
@@ -1217,6 +1236,12 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       None => Ok(Property::Static(default)),
     }
   };
+  let prop_opacity = |c: &Cursor<'_>, pos: Option<usize>| -> Result<Property<f32>> {
+    match pos {
+      Some(pos) => parse_property_free(&mut c.fork_at(pos), limits, parse_scalar),
+      None => Ok(Property::Static(100.0)),
+    }
+  };
   // Match rlottie_2019's primitive direction dispatch: it only reads `d`
   // after `ty`. Some Telegram patterns rely on the resulting winding to
   // cut holes in a non-zero fill. Dash arrays keep their independent d_pos.
@@ -1253,8 +1278,8 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
         offset: obj_start,
         what: "fill missing color",
       })?;
-      let color = parse_property(&mut c.fork_at(c_pos), limits, parse_color)?;
-      let opacity = prop_scalar(c, o_pos, 100.0)?;
+      let color = parse_property_free(&mut c.fork_at(c_pos), limits, parse_color)?;
+      let opacity = prop_opacity(c, o_pos)?;
       // In a fill item, `r` is the fill rule (int), not a property.
       let rule = match r_pos {
         Some(pos) => {
@@ -1272,19 +1297,19 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       // Group transform: rebuild from recorded field positions.
       let mut tf = Transform::identity();
       if let Some(pos) = a_pos {
-        tf.anchor = parse_property(&mut c.fork_at(pos), limits, parse_vec2)?;
+        tf.anchor = parse_property_free(&mut c.fork_at(pos), limits, parse_vec2)?;
       }
       if let Some(pos) = p_pos {
         tf.position = parse_position(&mut c.fork_at(pos), limits)?;
       }
       if let Some(pos) = s_pos {
-        tf.scale = parse_property(&mut c.fork_at(pos), limits, parse_vec2)?;
+        tf.scale = parse_property_free(&mut c.fork_at(pos), limits, parse_vec2)?;
       }
       if let Some(pos) = r_pos {
-        tf.rotation = parse_property(&mut c.fork_at(pos), limits, parse_scalar)?;
+        tf.rotation = parse_property_free(&mut c.fork_at(pos), limits, parse_scalar)?;
       }
       if let Some(pos) = o_pos {
-        tf.opacity = parse_property(&mut c.fork_at(pos), limits, parse_scalar)?;
+        tf.opacity = parse_property_free(&mut c.fork_at(pos), limits, parse_scalar)?;
       }
       Ok(ParsedItem::GroupTransform(tf))
     }
@@ -1297,9 +1322,9 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
         offset: obj_start,
         what: "stroke missing width",
       })?;
-      let color = parse_property(&mut c.fork_at(c_pos), limits, parse_color)?;
+      let color = parse_property_free(&mut c.fork_at(c_pos), limits, parse_color)?;
       let width = parse_property(&mut c.fork_at(w_pos), limits, parse_scalar)?;
-      let opacity = prop_scalar(c, o_pos, 100.0)?;
+      let opacity = prop_opacity(c, o_pos)?;
       let cap = match line_cap as i64 {
         2 => Cap::Round,
         3 => Cap::Square,
@@ -1341,7 +1366,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       let start = parse_property(&mut c.fork_at(s_pos_), limits, parse_vec2)?;
       let end = parse_property(&mut c.fork_at(e_pos_), limits, parse_vec2)?;
       let (stops, color_count) = parse_gradient_stops(&mut c.fork_at(g_pos_), limits)?;
-      let opacity = prop_scalar(c, o_pos, 100.0)?;
+      let opacity = prop_opacity(c, o_pos)?;
       let rule = match r_pos {
         Some(pos) => {
           if parse_f32(&mut c.fork_at(pos))? as i64 == 2 {
@@ -1398,7 +1423,7 @@ fn parse_shape_item(c: &mut Cursor<'_>, limits: &Limits) -> Result<ParsedItem> {
       let end = parse_property(&mut c.fork_at(e_pos_), limits, parse_vec2)?;
       let (stops, color_count) = parse_gradient_stops(&mut c.fork_at(g_pos_), limits)?;
       let width = parse_property(&mut c.fork_at(w_pos_), limits, parse_scalar)?;
-      let opacity = prop_scalar(c, o_pos, 100.0)?;
+      let opacity = prop_opacity(c, o_pos)?;
       let cap = match line_cap as i64 {
         2 => Cap::Round,
         3 => Cap::Square,
@@ -1521,7 +1546,7 @@ fn parse_gradient_stops(c: &mut Cursor<'_>, limits: &Limits) -> Result<(Property
   let mut stops: Option<Property<FloatList>> = None;
   parse_object_once!(c, |c, key| {
     b"p" => { count = parse_f32(c)? as usize; },
-    b"k" => { stops = Some(parse_property(c, limits, |c| parse_f32_list(c, limits.max_gradient_stop_values, Limit::GradientStopValues))?); },
+    b"k" => { stops = Some(parse_property_free(c, limits, |c| parse_f32_list(c, limits.max_gradient_stop_values, Limit::GradientStopValues))?); },
     _ => { c.skip_value()?; },
   })?;
   let stops = stops.ok_or_else(|| invalid(c, "gradient stops missing k"))?;
@@ -2206,13 +2231,13 @@ fn parse_repeater_transform(c: &mut Cursor<'_>, limits: &Limits) -> Result<(Tran
   let mut so = Property::Static(100.0);
   let mut eo = Property::Static(100.0);
   parse_object_once!(c, |c, key| {
-    b"a" => { tf.anchor = parse_property(c, limits, parse_vec2)?; },
+    b"a" => { tf.anchor = parse_property_free(c, limits, parse_vec2)?; },
     b"p" => { tf.position = parse_position(c, limits)?; },
-    b"s" => { tf.scale = parse_property(c, limits, parse_vec2)?; },
-    b"r" => { tf.rotation = parse_property(c, limits, parse_scalar)?; },
-    b"o" => { tf.opacity = parse_property(c, limits, parse_scalar)?; },
-    b"so" => { so = parse_property(c, limits, parse_scalar)?; },
-    b"eo" => { eo = parse_property(c, limits, parse_scalar)?; },
+    b"s" => { tf.scale = parse_property_free(c, limits, parse_vec2)?; },
+    b"r" => { tf.rotation = parse_property_free(c, limits, parse_scalar)?; },
+    b"o" => { tf.opacity = parse_property_free(c, limits, parse_scalar)?; },
+    b"so" => { so = parse_property_free(c, limits, parse_scalar)?; },
+    b"eo" => { eo = parse_property_free(c, limits, parse_scalar)?; },
     _ => { c.skip_value()?; },
   })?;
   Ok((tf, so, eo))
@@ -2257,7 +2282,7 @@ fn parse_masks(c: &mut Cursor<'_>, limits: &Limits) -> Result<Vec<Mask>> {
       return Err(Error::LimitExceeded(Limit::MaskPathPoints));
     }
     let opacity = match o_pos {
-      Some(pos) => parse_property(&mut c.fork_at(pos), limits, parse_scalar)?,
+      Some(pos) => parse_property_free(&mut c.fork_at(pos), limits, parse_scalar)?,
       None => Property::Static(100.0),
     };
     c.reserve(&mut out, 1)?;

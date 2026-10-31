@@ -490,3 +490,44 @@ fn asset_indices_resolve_forward_missing_and_duplicate_ids() {
     assert_eq!(comp.assets[0].layers[0].asset_index, Some(2));
   }
 }
+
+/// `y` of a cubic Bézier easing at the progress `x`, solved by bisection.
+fn bezier_y(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+  let at = |a: f32, b: f32, t: f32| 3.0 * (1.0 - t) * (1.0 - t) * t * a + 3.0 * (1.0 - t) * t * t * b + t * t * t;
+  let (mut low, mut high) = (0.0f32, 1.0f32);
+  for _ in 0..60 {
+    let t = (low + high) / 2.0;
+    if at(x1, x2, t) < x {
+      low = t;
+    } else {
+      high = t;
+    }
+  }
+  at(y1, y2, (low + high) / 2.0)
+}
+
+/// Row 34 of the comparison of Telegram X, the bottle of `AnimatedEmojies`: AE exports speed over
+/// a tiny change of a value as easing handles far outside [0, 1]. A rotation takes them as they
+/// are, like rlottie and Skottie; bounded to ±100 it turned the other way.
+#[test]
+fn easing_handles_of_transforms_keep_their_overshoot() {
+  let json = r#"{"v":"5.5.2","fr":60,"ip":0,"op":120,"w":64,"h":64,"layers":[
+    {"ddd":0,"ind":0,"ty":4,"sr":1,"ip":0,"op":120,"st":0,
+     "ks":{"r":{"a":1,"k":[
+       {"t":72,"s":[8.004],"o":{"x":[0.333],"y":[-286.279]},"i":{"x":[0.667],"y":[-13.846]}},
+       {"t":99,"s":[7.952]}]},
+       "p":{"a":0,"k":[32,32,0]},"a":{"a":0,"k":[0,0,0]},"s":{"a":0,"k":[100,100,100]},
+       "o":{"a":0,"k":100}},
+     "shapes":[{"ty":"gr","it":[
+       {"ty":"rc","p":{"a":0,"k":[0,0]},"s":{"a":0,"k":[20,20]},"r":{"a":0,"k":0}},
+       {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":100}},
+       {"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]},"s":{"a":0,"k":[100,100]},
+        "o":{"a":0,"k":100},"r":{"a":0,"k":0}}]}]}]}"#;
+  let comp = parse(json).unwrap();
+  let progress = (83.0 - 72.0) / (99.0 - 72.0);
+  let free = 8.004 + (7.952 - 8.004) * bezier_y(0.333, -286.279, 0.667, -13.846, progress);
+  let bounded = 8.004 + (7.952 - 8.004) * bezier_y(0.333, -100.0, 0.667, -13.846, progress);
+  let rotation = comp.layers[0].transform.rotation.eval(83.0);
+  assert!((free - bounded).abs() > 1.0, "the sample doesn't tell them apart: {free} {bounded}");
+  assert!((rotation - free).abs() < 0.01, "rotation {rotation}, expected {free}, bounded {bounded}");
+}
