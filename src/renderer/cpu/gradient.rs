@@ -9,27 +9,33 @@ pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity:
   let data = &stops.0;
   let n = color_count.min(data.len() / 4);
   let mut lut = [0u32; GRADIENT_LUT_SIZE];
-  let opac = data.get(n * 4..).unwrap_or(&[]);
-  let opacity_stop_count = if opac.len() >= 4 && opac.len() % 2 == 0 { opac.len() / 2 } else { 0 };
+  let opac_raw = data.get(n * 4..).unwrap_or(&[]);
+  let opacity_stop_count = if opac_raw.len() >= 4 && opac_raw.len() % 2 == 0 { opac_raw.len() / 2 } else { 0 };
+  // Exports can list stops out of order. Like Skia under Skottie, a stop before
+  // the position of an earlier one is pinned to it, so positions never go back.
+  let mut colors: Vec<(f32, f32, f32, f32)> = data.chunks_exact(4).take(n).map(|c| (c[0], c[1], c[2], c[3])).collect();
+  let mut opac: Vec<(f32, f32)> = opac_raw.chunks_exact(2).take(opacity_stop_count).map(|o| (o[0], o[1])).collect();
+  let mut reached = f32::NEG_INFINITY;
+  for stop in &mut colors {
+    stop.0 = stop.0.max(reached);
+    reached = stop.0;
+  }
+  reached = f32::NEG_INFINITY;
+  for stop in &mut opac {
+    stop.0 = stop.0.max(reached);
+    reached = stop.0;
+  }
   let uniform_stop_alpha = if opacity_stop_count == 0 {
     Some(1.0)
   } else {
-    let alpha = opac.get(1).copied().unwrap_or(1.0);
-    opac.chunks_exact(2).all(|stop| stop.get(1).copied().unwrap_or(1.0) == alpha).then_some(alpha)
+    let alpha = opac.first().map_or(1.0, |stop| stop.1);
+    opac.iter().all(|stop| stop.1 == alpha).then_some(alpha)
   };
   let uniform_alpha = uniform_stop_alpha.map(|alpha| ((alpha * opacity).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
 
   for (i, slot) in lut.iter_mut().enumerate() {
     let t = i as f32 / (GRADIENT_LUT_SIZE - 1) as f32;
-    let color = |index: usize| {
-      let base = index.saturating_mul(4);
-      (
-        data.get(base).copied().unwrap_or(0.0),
-        data.get(base + 1).copied().unwrap_or(0.0),
-        data.get(base + 2).copied().unwrap_or(0.0),
-        data.get(base + 3).copied().unwrap_or(0.0),
-      )
-    };
+    let color = |index: usize| colors.get(index).copied().unwrap_or((0.0, 0.0, 0.0, 0.0));
     let first = color(0);
     let last = color(n.saturating_sub(1));
     let (r, g, b) = if n == 0 {
@@ -54,10 +60,7 @@ pub(crate) fn build_gradient_lut(stops: &FloatList, color_count: usize, opacity:
     let stop_alpha = if opacity_stop_count == 0 {
       1.0
     } else {
-      let opacity_stop = |index: usize| {
-        let base = index.saturating_mul(2);
-        (opac.get(base).copied().unwrap_or(0.0), opac.get(base + 1).copied().unwrap_or(1.0))
-      };
+      let opacity_stop = |index: usize| opac.get(index).copied().unwrap_or((0.0, 1.0));
       let first = opacity_stop(0);
       let last = opacity_stop(opacity_stop_count - 1);
       if t <= first.0 {

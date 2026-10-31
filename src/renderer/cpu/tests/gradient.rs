@@ -81,3 +81,29 @@ fn lut_retains_uniform_alpha_metadata_from_stops() {
   let varying = build_gradient_lut(&FloatList(varying), 2, 1.0);
   assert_eq!(varying.uniform_alpha(), None);
 }
+
+#[test]
+fn unsorted_stops_are_pinned_to_earlier_positions() {
+  // Exports can list stops out of order, e.g. the glare of the gift "Agent D".
+  // Like Skia under Skottie, a stop before the position of an earlier one is
+  // pinned to it: here the opacity fades out at the end, though the last stop
+  // in the file is in the middle.
+  let unsorted = FloatList(vec![
+    0.0, 1.0, 1.0, 1.0, //
+    1.0, 1.0, 1.0, 1.0, //
+    0.5, 1.0, 1.0, 1.0, //
+    0.0, 1.0, 1.0, 0.0, 0.5, 0.6,
+  ]);
+  let pinned = FloatList(vec![
+    0.0, 1.0, 1.0, 1.0, //
+    1.0, 1.0, 1.0, 1.0, //
+    1.0, 1.0, 1.0, 1.0, //
+    0.0, 1.0, 1.0, 0.0, 1.0, 0.6,
+  ]);
+  let a = build_gradient_lut(&unsorted, 3, 1.0);
+  let b = build_gradient_lut(&pinned, 3, 1.0);
+  assert!(a[GRADIENT_LUT_SIZE * 9 / 10] >> 24 < 64);
+  for i in 0..GRADIENT_LUT_SIZE {
+    assert_eq!(a[i], b[i], "index {i}");
+  }
+}
