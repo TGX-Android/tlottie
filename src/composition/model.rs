@@ -327,6 +327,14 @@ pub(crate) fn shapes_have_multiple_paints(shapes: &[Shape]) -> bool {
   count > 1
 }
 
+/// Matte source of the `tt` consumer at `idx`: the layer directly above it,
+/// unless that layer is itself a consumer. A chain of consumers doesn't matte
+/// one by the other: like rlottie and Skottie, the lower ones aren't drawn,
+/// and the upper one stays drawn with its own source.
+pub(crate) fn matte_source(layers: &[Layer], idx: usize) -> Option<&Layer> {
+  idx.checked_sub(1).and_then(|j| layers.get(j)).filter(|src| src.matte.is_none())
+}
+
 /// Counts only paints visible at this frame. Paints whose evaluated opacity
 /// truncates to zero cannot contribute pixels and do not force isolation.
 pub(crate) fn shapes_have_multiple_visible_paints(shapes: &[Shape], frame: f32) -> bool {

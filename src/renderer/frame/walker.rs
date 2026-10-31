@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::geometry::{clip_contour, clip_to_quad, flatten_path, rect_contour, Contour};
 use crate::limits::Limits;
 use crate::math::{Color, Mat2x3, Vec2};
-use crate::model::{shapes_have_multiple_visible_paints, shapes_static, Composition, FillRule, Layer, LayerKind};
+use crate::model::{matte_source, shapes_have_multiple_visible_paints, shapes_static, Composition, FillRule, Layer, LayerKind};
 use crate::renderer::cpu::executor::{layer_transform_at, opacity_byte, parent_chain_matrix, ClipQuad, DrawJob, GradientMapKind, PendingJob, RenderCtx, RenderScratch, ShapeWalker, MAX_PRECOMP_DEPTH};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -483,7 +483,7 @@ impl RenderCtx<'_> {
     renderer.status()?;
     let mut consumed_as_matte = vec![false; layers.len()];
     for (i, l) in layers.iter().enumerate() {
-      if l.matte.is_some() {
+      if l.matte.is_some() && matte_source(layers, i).is_some() {
         if let Some(slot) = i.checked_sub(1).and_then(|j| consumed_as_matte.get_mut(j)) {
           *slot = true;
         }
@@ -504,7 +504,8 @@ impl RenderCtx<'_> {
         continue;
       }
       if let Some(kind) = layer.matte {
-        let Some(src) = idx.checked_sub(1).and_then(|j| layers.get(j)) else {
+        // A consumer without a source isn't drawn, see `matte_source`
+        let Some(src) = matte_source(layers, idx) else {
           continue;
         };
         // A track-matte consumer is transparent while its source layer is

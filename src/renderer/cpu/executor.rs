@@ -18,7 +18,7 @@ use crate::math::{Color, Mat2x3, Vec2};
 use crate::model::shapes_have_multiple_paints;
 #[cfg(test)]
 use crate::model::LayerKind;
-use crate::model::{Composition, DashElement, FillRule, FloatList, GradientKind, Layer, Shape, Transform, TrimMode};
+use crate::model::{matte_source, Composition, DashElement, FillRule, FloatList, GradientKind, Layer, Shape, Transform, TrimMode};
 use crate::raster::Rasterizer;
 use crate::renderer::frame::renderer::{GradientLut, GRADIENT_LUT_SIZE};
 use crate::stroke::{stroke_polyline, StrokeSegment};
@@ -414,7 +414,7 @@ impl RenderCtx<'_> {
     // order; that source layer is not drawn on its own.
     let mut consumed_as_matte = vec![false; layers.len()];
     for (i, l) in layers.iter().enumerate() {
-      if l.matte.is_some() {
+      if l.matte.is_some() && matte_source(layers, i).is_some() {
         if let Some(slot) = i.checked_sub(1).and_then(|j| consumed_as_matte.get_mut(j)) {
           *slot = true;
         }
@@ -422,6 +422,10 @@ impl RenderCtx<'_> {
     }
     for (idx, layer) in layers.iter().enumerate().rev() {
       if consumed_as_matte.get(idx).copied().unwrap_or(false) {
+        continue;
+      }
+      // A consumer without a source isn't drawn, see `matte_source`
+      if layer.matte.is_some() && matte_source(layers, idx).is_none() {
         continue;
       }
       if !self.layer_visible(layer, frame) {
@@ -482,7 +486,7 @@ impl RenderCtx<'_> {
           scratch.put_u8(maskbuf);
         }
         if layer.matte.is_some() {
-          if let Some(src) = idx.checked_sub(1).and_then(|j| layers.get(j)) {
+          if let Some(src) = matte_source(layers, idx) {
             let mut buf_b = scratch.take_u32(w * h);
             let (src_m, src_op) = layer_transform_at(src, frame);
             // A track-matte source is sampled for the consumer's lifetime;

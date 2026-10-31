@@ -198,6 +198,30 @@ fn orphan_matte_source_remains_visible() {
 }
 
 #[test]
+fn chained_matte_consumer_keeps_its_neighbor_drawn() {
+  // Two consumers in a row: the upper one is matted by the `td` source above
+  // it and stays drawn, the lower one has no source of its own and isn't
+  // drawn, as in rlottie and Skottie. Matting the lower one by the upper one
+  // used to hide the upper one, e.g. the head of a figure.
+  let composition = Composition::parse(
+    br##"{"fr":30,"ip":0,"op":1,"w":4,"h":4,"layers":[
+      {"ty":1,"ind":1,"td":1,"sw":2,"sh":4,"sc":"#ff00ff","ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[1,2]},"a":{"a":0,"k":[1,2]},"s":{"a":0,"k":[100,100]}}},
+      {"ty":1,"ind":2,"tt":2,"sw":4,"sh":4,"sc":"#00ff00","ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[2,2]},"a":{"a":0,"k":[2,2]},"s":{"a":0,"k":[100,100]}}},
+      {"ty":1,"ind":3,"tt":2,"sw":4,"sh":4,"sc":"#ffffff","ip":0,"op":1,"st":0,"ks":{"o":{"a":0,"k":100},"p":{"a":0,"k":[2,2]},"a":{"a":0,"k":[2,2]},"s":{"a":0,"k":[100,100]}}}
+    ]}"##,
+    &Limits::default(),
+  )
+  .unwrap();
+  let mut renderer = crate::CPURenderer::new(composition);
+  let mut pixels = [0u32; 16];
+  renderer.render(0.0, &mut pixels, 4, 4, RenderOptions::default()).unwrap();
+  // Left half: the source hides the upper consumer, the lower one isn't drawn
+  assert_eq!(pixels[5], 0);
+  // Right half: the upper consumer
+  assert_eq!(pixels[6], 0xff00_ff00);
+}
+
+#[test]
 fn matte_source_precomp_opacity_is_applied_after_flattening() {
   let composition = Composition::parse(
     br##"{"fr":30,"ip":0,"op":1,"w":4,"h":4,
