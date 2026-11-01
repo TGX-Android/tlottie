@@ -165,9 +165,12 @@ pub(crate) fn radial_map(start: Vec2, end: Vec2, inv: Mat2x3, hl_len_pct: f32, h
   let dx = end.x - start.x;
   let dy = end.y - start.y;
   // rlottie measures the radius with its approximate metric
-  // (radial.cradius = VLine::length(start, end)).
+  // (radial.cradius = VLine::length(start, end)), up to 6.8 % larger than the true length, which
+  // Skottie and lottie-web take. A gradient without a highlight takes the true length; one with a
+  // highlight keeps the metric of rlottie, which its focal point follows
   let r = crate::geometry::seg_len_rlottie(dx, dy);
   if hl_len_pct.abs() < 0.01 || r < 1e-6 {
+    let r = (dx * dx + dy * dy).sqrt();
     return GradientMap {
       inv,
       kind: GradientMapKind::Radial {
